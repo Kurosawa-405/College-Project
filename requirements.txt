@@ -1,0 +1,12 @@
+streamlit==1.38.0
+pandas==2.2.2
+numpy==2.1.1
+matplotlib==3.9.2
+prophet==1.1.5
+statsmodels==0.14.2
+scikit-learn==1.5.1
+shap==0.48.0
+ollama==0.3.3
+cmdstanpy==1.2.0
+openpyxl==3.1.5
+plotly==5.22.0
