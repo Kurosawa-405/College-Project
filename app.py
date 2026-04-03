@@ -1,8 +1,12 @@
 # Run with: streamlit run app.py
+import json
+import time
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+
+import requests
 from prophet import Prophet
 from prophet.diagnostics import cross_validation, performance_metrics
 from statsmodels.tsa.arima.model import ARIMA
@@ -10,11 +14,10 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.ensemble import GradientBoostingRegressor
 import shap
 import ollama
+import re
 
 
-
-# 🔥 CRITICAL FIX: NumPy compatibility patch
-# Fixes errors from shap / prophet using deprecated numpy types
+# 🔥 NumPy compatibility patch
 if not hasattr(np, "float"):
     np.float = np.float64
 if not hasattr(np, "int"):
@@ -104,6 +107,19 @@ st.markdown("""
     display: inline-block;
 }
 
+/* News badge */
+.news-badge {
+    background: #eff6ff;
+    color: #1d4ed8;
+    border: 1px solid #bfdbfe;
+    border-radius: 999px;
+    padding: 0.15rem 0.6rem;
+    font-size: 0.7rem;
+    font-weight: 600;
+    display: inline-block;
+    margin-bottom: 0.5rem;
+}
+
 /* Chat bubbles */
 .chat-user {
     background: #2563eb;
@@ -127,6 +143,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+
 # ---------------------------
 # Auth State
 # ---------------------------
@@ -141,6 +158,7 @@ if "username" not in st.session_state:
     st.session_state.username = ""
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+
 
 # ---------------------------
 # LOGIN PAGE
@@ -168,6 +186,7 @@ def login_page():
 
         st.caption("Demo — **admin@example.com** / **admin123**")
 
+
 # ---------------------------
 # DATA & INDEX
 # ---------------------------
@@ -176,13 +195,13 @@ def load_data():
     import os
     data_file = "G20_Historical_Data_2010_2024_v2.xlsx"
     if not os.path.exists(data_file):
-        st.error(f"**Missing data file:** `{data_file}`\\n\\n"
-                 "**Fix:** Ensure the Excel file is in the project root. "
-                 "It contains G20 data 2010-2024. If lost, re-download from source.**")
+        st.error(
+            f"**Missing data file:** `{data_file}`\n\n"
+            "Ensure the Excel file is in the project root."
+        )
         st.stop()
-    
-    df = pd.read_excel(data_file, header=2)
 
+    df = pd.read_excel(data_file, header=2)
     df.columns = [
         "country", "Year", "gdp_per_capita", "hdi",
         "internet_penetration", "patents", "startups",
@@ -199,8 +218,10 @@ def load_data():
     df = df.dropna()
     return df
 
+
 def normalize(series):
     return (series - series.min()) / (series.max() - series.min())
+
 
 def compute_index(df):
     df = df.copy()
@@ -222,6 +243,7 @@ def compute_index(df):
     )
     return df
 
+
 # ---------------------------
 # CHART STYLE HELPER
 # ---------------------------
@@ -232,26 +254,331 @@ def style_ax(ax, fig):
     ax.grid(axis="y", linestyle="--", alpha=0.35, color="#d1d5db")
     ax.tick_params(labelsize=9)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DYNAMIC SCENARIOS  (llama3.2:3b + DuckDuckGo news)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_LLAMA_MODEL     = "llama3.2:3b"
+_SCENARIO_TTL    = 3600   # seconds before re-fetching news
+
+_DEFAULT_SCENARIOS = {
+    "Base Case": {
+        "arima_order":       (2, 1, 2),
+        "changepoint_prior": 0.05,
+        "rationale":         "Neutral defaults — news fetch unavailable.",
+    },
+    "Optimistic": {
+        "arima_order":       (2, 1, 1),
+        "changepoint_prior": 0.50,
+        "rationale":         "Tech-positive environment assumed.",
+    },
+    "Pessimistic": {
+        "arima_order":       (2, 2, 2),
+        "changepoint_prior": 0.001,
+        "rationale":         "Heightened disruption risk assumed.",
+    },
+}
+
+_LLAMA_SYSTEM = """\
+You are an expert economic modeller. Given a list of recent AI and labour-market
+news headlines, output ONLY a valid JSON object — no markdown, no explanation,
+no preamble. The JSON must have exactly this structure:
+
+{
+  "Base Case": {
+    "arima_p": <int 1-3>,
+    "arima_d": <int 1-2>,
+    "arima_q": <int 1-3>,
+    "changepoint_prior": <float 0.001-0.95>,
+    "rationale": "<one sentence>"
+  },
+  "Optimistic": {
+    "arima_p": <int 1-3>,
+    "arima_d": <int 1-2>,
+    "arima_q": <int 1-3>,
+    "changepoint_prior": <float 0.001-0.95>,
+    "rationale": "<one sentence>"
+  },
+  "Pessimistic": {
+    "arima_p": <int 1-3>,
+    "arima_d": <int 1-2>,
+    "arima_q": <int 1-3>,
+    "changepoint_prior": <float 0.001-0.95>,
+    "rationale": "<one sentence>"
+  }
+}
+
+Parameter guidance:
+- Higher arima_d (1→2)          = more volatile / uncertain trend
+- Higher changepoint_prior       = model allows rapid trend shifts  (Optimistic)
+- Lower  changepoint_prior       = model assumes stable/slow trend  (Pessimistic)
+- Base Case should be middle-ground
+- Derive all values from the sentiment of the provided headlines
+"""
+
+def _normalize_llama_keys(llama_out: dict) -> dict:
+    """
+    Normalize Llama's JSON keys to expected format.
+    Handles common variations like lowercase, underscores, etc.
+    """
+    normalized = {}
+    expected = ["Base Case", "Optimistic", "Pessimistic"]
+    
+    for key in llama_out:
+        orig_key = key.strip().lower()
+        if any(word in orig_key for word in ['base', 'neutral']):
+            norm_key = "Base Case"
+        elif 'optimist' in orig_key or 'positive' in orig_key:
+            norm_key = "Optimistic"
+        elif 'pessimist' in orig_key or 'negative' in orig_key:
+            norm_key = "Pessimistic"
+        else:
+            norm_key = key.title()
+        
+        if norm_key in expected:
+            normalized[norm_key] = llama_out[key]
+    
+    print(f"[NORMALIZE] Original: {list(llama_out.keys())} -> {list(normalized.keys())}")
+    return normalized
+
+
+def _fetch_headlines(max_results: int = 8) -> list:
+    """Fetch AI/employment headlines via DuckDuckGo; static fallback if unavailable."""
+    headlines = []
+    queries = [
+        "AI automation jobs employment 2024",
+        "artificial intelligence workforce impact",
+    ]
+    for q in queries:
+        try:
+            r = requests.get(
+                "https://api.duckduckgo.com/",
+                params={"q": q, "format": "json", "no_html": 1, "skip_disambig": 1},
+                timeout=6,
+            )
+            data = r.json()
+            for topic in data.get("RelatedTopics", []):
+                text = topic.get("Text", "")
+                if text and len(text) > 20:
+                    headlines.append(text[:200])
+                if len(headlines) >= max_results:
+                    break
+        except Exception:
+            pass
+        if len(headlines) >= max_results:
+            break
+
+    if len(headlines) < 3:
+        headlines = [
+            "AI adoption accelerating across G20 economies, IMF report shows.",
+            "Automation displacing routine jobs in manufacturing and services sectors.",
+            "Tech investment in AI infrastructure hits record levels globally.",
+            "Labour markets show resilience despite automation pressures.",
+            "G20 nations pledge AI governance frameworks to protect workers.",
+            "Generative AI tools increasing productivity in knowledge-work sectors.",
+            "Rising demand for AI skills creates new employment opportunities.",
+            "Policymakers debate universal basic income amid automation concerns.",
+        ]
+
+    return headlines[:max_results]
+
+
+def _ask_llama_for_scenarios(headlines: list) -> dict | None:
+    """Send headlines to llama3.2:3b and parse its JSON response (robust version)."""
+
+    headline_block = "\n".join(f"- {h}" for h in headlines)
+    user_msg = (
+        f"Here are today's AI and employment news headlines:\n{headline_block}\n\n"
+        "Return ONLY a complete, valid JSON object. "
+        "Do NOT truncate. Include ALL required fields."
+    )
+
+    client = ollama.Client(host="http://host.docker.internal:11434")
+
+    try:
+        response = client.chat(
+            model=_LLAMA_MODEL,
+            messages=[
+                {"role": "system", "content": _LLAMA_SYSTEM},
+                {"role": "user",   "content": user_msg},
+            ],
+            options={"temperature": 0.05},
+        )
+        msg = response.get("message", {}) if isinstance(response, dict) else response.message
+
+        raw = (msg.get("content", "") if isinstance(msg, dict) else msg.content).strip()
+
+        print("\n" + "="*60)
+        print("[LLAMA RAW]:", raw[:500])
+        print("="*60)
+
+        # 🧹 Remove markdown blocks if present
+        if "```" in raw:
+            for part in raw.split("```"):
+                part = part.strip().lstrip("json").strip()
+                if part.startswith("{"):
+                    raw = part
+                    break
+
+        # 📦 Extract JSON safely
+        start = raw.find("{")
+        end   = raw.rfind("}") + 1
+
+        if start == -1 or end == 0:
+            raise ValueError("No valid JSON found")
+
+        json_str = raw[start:end]
+
+        # Enhanced repair
+        json_str = re.sub(r'```(?:json)?\\s*', '', json_str)
+        json_str = re.sub(r'```\\s*$', '', json_str, flags=re.MULTILINE)
+        json_str = re.sub(r',\\s*([}\\]]', r'\\1', json_str)
+        json_str = re.sub(r'",\\s*:\\s*"', '": "', json_str)
+        json_str = re.sub(r',\\s*}', '}', json_str)
+
+        parsed = json.loads(json_str)
+
+        print("[LLAMA KEYS]:", list(parsed.keys()))
+        print("[NORMALIZED KEYS]:", list(_normalize_llama_keys(parsed).keys()))
+
+        return parsed
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        print("[LLAMA ERROR]", err)
+        st.session_state["_llama_error"] = err
+        return None
+
+        print("\n" + "="*60)
+        print("[LLAMA RAW]:", raw[:500])
+        print("="*60)
+
+        # 🧹 Remove markdown blocks if present
+        if "```" in raw:
+            for part in raw.split("```"):
+                part = part.strip().lstrip("json").strip()
+                if part.startswith("{"):
+                    raw = part
+                    break
+
+        # 📦 Extract JSON safely
+        start = raw.find("{")
+        end   = raw.rfind("}") + 1
+
+        if start == -1 or end == 0:
+            raise ValueError("No valid JSON found")
+
+        json_str = raw[start:end]
+
+        # Enhanced repair
+        json_str = re.sub(r'```(?:json)?\\s*', '', json_str)
+        json_str = re.sub(r'```\\s*$', '', json_str, flags=re.MULTILINE)
+        json_str = re.sub(r',\\s*([}\\]]', r'\\1', json_str)
+        json_str = re.sub(r'",\\s*:\\s*"', '": "', json_str)
+        json_str = re.sub(r',\\s*}', '}', json_str)
+
+        parsed = json.loads(json_str)
+
+        print("[LLAMA KEYS]:", list(parsed.keys()))
+        print("[NORMALIZED KEYS]:", list(_normalize_llama_keys(parsed).keys()))
+
+        return parsed
+
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        print("[LLAMA ERROR]", err)
+        st.session_state["_llama_error"] = err
+        return None
+
+def _build_scenarios_from_llama(llama_out: dict) -> dict:
+    llama_out = _normalize_llama_keys(llama_out or {})
+
+    scenarios = {}
+    for name in ("Base Case", "Optimistic", "Pessimistic"):
+        cfg = llama_out.get(name, {})
+        if not isinstance(cfg, dict):
+            print(f"[LLAMA] Using default for {name}")
+            scenarios[name] = dict(_DEFAULT_SCENARIOS[name])
+            continue
+
+        # Flexible extraction with defaults & validation
+        try:
+            p = int(cfg.get('arima_p', 2))
+            d = int(cfg.get('arima_d', 1))
+            q = int(cfg.get('arima_q', 2))
+            cp = float(cfg.get('changepoint_prior', 0.05))
+            rationale = str(cfg.get('rationale', f'Llama param for {name}'))
+        except (ValueError, TypeError) as e:
+            print(f"[LLAMA CAST] {name}: {e} -> default")
+            fb = _DEFAULT_SCENARIOS[name]
+            p, d, q = fb["arima_order"]
+            cp = fb["changepoint_prior"]
+            rationale = fb["rationale"]
+
+        scenarios[name] = {
+            "arima_order": (max(1, min(p, 3)), max(1, min(d, 2)), max(1, min(q, 3))),
+            "changepoint_prior": max(0.001, min(cp, 0.95)),
+            "rationale": rationale
+        }
+        print(f"[SUCCESS] {name}: ARIMA({p},{d},{q}) CP={cp:.3f}")
+    return scenarios
+
+
+def load_dynamic_scenarios(force: bool = False) -> dict:
+    """
+    Load scenarios from llama3.2:3b + news.
+    Pass force=True (or set session _force_refresh=True) to bypass TTL cache.
+    """
+    force = force or st.session_state.pop("_force_refresh", False)
+
+    cache = st.session_state.get("_scenario_cache", {})
+    if not force and cache and (time.time() - cache.get("ts", 0)) < _SCENARIO_TTL:
+        return cache["scenarios"]
+
+    # Clear stale debug state
+    for k in ("_llama_error", "_llama_raw", "scenario_news", "scenario_source"):
+        st.session_state.pop(k, None)
+
+    with st.spinner("🤖 llama3.2:3b is reading the news to calibrate scenarios…"):
+        headlines = _fetch_headlines()
+        st.session_state["scenario_news"] = headlines
+
+        llama_out = _ask_llama_for_scenarios(headlines)
+
+        if llama_out:
+            scenarios = _build_scenarios_from_llama(llama_out)
+            st.session_state["scenario_source"] = "llama3.2:3b"
+            st.session_state["_llama_raw"] = llama_out   # store for debug view
+        else:
+            scenarios = {k: dict(v) for k, v in _DEFAULT_SCENARIOS.items()}
+            st.session_state["scenario_source"] = "defaults"
+            st.session_state["scenario_news"] = headlines + [
+                "⚠️  llama3.2:3b unavailable — using hardcoded defaults. "
+                "Run: ollama pull llama3.2:3b"
+            ]
+
+    st.session_state["_scenario_cache"] = {"ts": time.time(), "scenarios": scenarios}
+    return scenarios
+
+
 # ---------------------------
-# OLLAMA HELPERS
+# OLLAMA CHAT HELPERS
 # ---------------------------
 @st.cache_data(ttl=30)
 def get_ollama_models():
-    """Return list of locally available Ollama model names."""
     try:
         result = ollama.list()
-        # ollama.list() returns a dict with a 'models' key (list of dicts with 'name')
         models = result.get("models", [])
         return [m["name"] for m in models] if models else []
     except Exception:
         return []
 
+
 def build_system_prompt(df: pd.DataFrame, global_df: pd.DataFrame) -> str:
-    """Inject live dashboard statistics into the system prompt."""
-    last_year = int(global_df["Year"].max())
-    latest_global = global_df["AI_employability"].iloc[-1]
-    earliest_global = global_df["AI_employability"].iloc[0]
-    first_year = int(global_df["Year"].min())
+    last_year        = int(global_df["Year"].max())
+    latest_global    = global_df["AI_employability"].iloc[-1]
+    earliest_global  = global_df["AI_employability"].iloc[0]
+    first_year       = int(global_df["Year"].min())
 
     latest_year_df = df[df["Year"] == last_year].sort_values(
         "AI_employability", ascending=False
@@ -277,16 +604,22 @@ Bottom 3 countries ({last_year}):
 {bot3}
 
 == Your role ==
-Answer questions about the data, explain trends, compare countries, discuss implications for workforce policy, or interpret the index methodology. Be concise, data-grounded, and policy-aware. If asked about projections, note that the dashboard uses ARIMA and Prophet models.
+Answer questions about the data, explain trends, compare countries, discuss implications for workforce policy, or interpret the index methodology. Be concise, data-grounded, and policy-aware. If asked about projections, note that the dashboard uses ARIMA and Prophet models whose parameters are dynamically calibrated by llama3.2:3b reading current AI/employment news.
 """
 
+
 def stream_ollama(model: str, messages: list):
-    """Yield text chunks from an Ollama streaming chat call."""
     stream = ollama.chat(model=model, messages=messages, stream=True)
     for chunk in stream:
-        delta = chunk.get("message", {}).get("content", "")
+        # Handle both SDK <0.2 (dict) and >=0.2 (object) shapes
+        if isinstance(chunk, dict):
+            delta = chunk.get("message", {}).get("content", "")
+        else:
+            msg   = chunk.message
+            delta = msg.content if hasattr(msg, "content") else ""
         if delta:
             yield delta
+
 
 # ---------------------------
 # MAIN DASHBOARD
@@ -295,6 +628,11 @@ def dashboard():
     df        = load_data()
     df        = compute_index(df)
     global_df = df.groupby("Year")["AI_employability"].mean().reset_index()
+
+    # ── _force_refresh is handled inside load_dynamic_scenarios itself ──
+
+    # ── Load dynamic scenarios (llama3.2:3b) ──
+    scenarios = load_dynamic_scenarios()
 
     # ── Top bar ──
     c1, c2, c3 = st.columns([5, 2, 1])
@@ -307,7 +645,8 @@ def dashboard():
     with c3:
         if st.button("Sign out", use_container_width=True):
             st.session_state.authenticated = False
-            st.session_state.chat_history = []
+            st.session_state.chat_history  = []
+            st.session_state.pop("_scenario_cache", None)
             st.rerun()
 
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
@@ -322,10 +661,45 @@ def dashboard():
             label_visibility="collapsed"
         )
         st.markdown("---")
+
+        # ── Model settings ──
         st.markdown("### Model settings")
         model_choice = st.selectbox("Forecast model", ["ARIMA", "Prophet"])
-        scenario     = st.selectbox("Scenario", ["Base Case", "Optimistic", "Pessimistic"])
+        scenario     = st.selectbox("Scenario", list(scenarios.keys()))
         show_all     = st.checkbox("Compare all scenarios", value=False)
+
+        # ── Scenario info (news-driven) ──
+        source = st.session_state.get("scenario_source", "defaults")
+        badge  = "🤖 llama3.2:3b" if source == "llama3.2:3b" else "⚙️ defaults"
+        st.markdown(
+            f'<div class="news-badge">{badge}</div>',
+            unsafe_allow_html=True
+        )
+        with st.expander("📰 News & scenario rationale"):
+            err = st.session_state.get("_llama_error")
+            if err:
+                st.error(f"⚠️ llama error (fell back to defaults):\n`{err}`")
+
+            # ── Live parameter table so you can see exactly what llama set ──
+            st.markdown("**Active parameters:**")
+            rows = []
+            for s_name, s_cfg in scenarios.items():
+                rows.append({
+                    "Scenario":  s_name,
+                    "ARIMA":     str(s_cfg["arima_order"]),
+                    "CP Prior":  round(s_cfg["changepoint_prior"], 4),
+                    "Rationale": s_cfg.get("rationale", ""),
+                })
+            st.dataframe(pd.DataFrame(rows).round(4), use_container_width=True, hide_index=True)
+
+            st.markdown("**Headlines fetched:**")
+            for headline in st.session_state.get("scenario_news", []):
+                st.caption(f"• {headline}")
+        if st.button("🔄 Refresh scenarios", use_container_width=docTrue):
+            st.session_state["_force_refresh"] = True
+            # Also nuke the cache key directly so TTL check definitely fails
+            st.session_state.pop("_scenario_cache", None)
+            st.rerun()
 
         # ── Ollama model picker ──
         st.markdown("---")
@@ -344,14 +718,14 @@ def dashboard():
         st.markdown("---")
         st.caption(f"Logged in as `{st.session_state.username}`")
 
-    scenarios = {
-        "Base Case":   {"arima_order": (2,1,2), "changepoint_prior": 0.05},
-        "Optimistic":  {"arima_order": (2,1,1), "changepoint_prior": 0.50},
-        "Pessimistic": {"arima_order": (2,2,2), "changepoint_prior": 0.001},
+    # ── Scenario colours (static per name) ──
+    scenario_colors = {
+        "Base Case":   "orange",
+        "Optimistic":  "green",
+        "Pessimistic": "red",
     }
-    scenario_colors = {"Base Case": "orange", "Optimistic": "green", "Pessimistic": "red"}
     config = scenarios[scenario]
-    color  = scenario_colors[scenario]
+    color  = scenario_colors.get(scenario, "steelblue")
 
     forecast_steps = 12
     last_Year      = int(global_df["Year"].max())
@@ -397,24 +771,16 @@ def dashboard():
         st.markdown('<hr class="divider">', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Country Rankings — Latest Year</div>',
                     unsafe_allow_html=True)
-
         latest = (
             df[df["Year"] == last_Year]
             .sort_values("AI_employability", ascending=False)
             [["country", "AI_employability", "gdp_per_capita", "hdi", "employment_rate"]]
             .reset_index(drop=True)
+            .round(4)
         )
         latest.index += 1
         latest.columns = ["Country", "AI Index", "GDP/Capita", "HDI", "Employment Rate"]
-        st.dataframe(
-            latest.style.format({
-                "AI Index": "{:.4f}",
-                "GDP/Capita": "{:,.0f}",
-                "HDI": "{:.3f}",
-                "Employment Rate": "{:.1f}"
-            }).background_gradient(subset=["AI Index"], cmap="Blues"),
-            use_container_width=True
-        )
+        st.dataframe(latest, use_container_width=True, hide_index=True)
 
     # ══════════════════════════════════════
     # PAGE: FORECAST
@@ -422,8 +788,18 @@ def dashboard():
     elif page == "🔮 Forecast":
         label = "All Scenarios" if show_all else scenario
         st.markdown('<div class="section-title">Forecast</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="section-subtitle">{model_choice} · {label} · {forecast_steps}-year horizon</div>',
-                    unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="section-subtitle">'
+            f'{model_choice} · {label} · {forecast_steps}-year horizon · '
+            f'parameters calibrated by {st.session_state.get("scenario_source","defaults")}'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
+        # Show the rationale for the active scenario
+        rationale = config.get("rationale", "")
+        if rationale:
+            st.info(f"**{scenario} rationale:** {rationale}", icon="🤖")
 
         if model_choice == "ARIMA":
             model_fit    = ARIMA(global_df["AI_employability"], order=config["arima_order"]).fit()
@@ -438,18 +814,18 @@ def dashboard():
 
             if show_all:
                 for s_name, s_cfg in scenarios.items():
-                    sc = scenario_colors[s_name]
+                    sc = scenario_colors.get(s_name, "gray")
                     m  = ARIMA(global_df["AI_employability"], order=s_cfg["arima_order"]).fit()
                     fc = m.get_forecast(steps=forecast_steps)
                     ci = fc.conf_int()
                     ax.plot(future_Years, fc.predicted_mean, linestyle="dashed",
                             label=s_name, color=sc, linewidth=2)
-                    ax.fill_between(future_Years, ci.iloc[:,0], ci.iloc[:,1],
+                    ax.fill_between(future_Years, ci.iloc[:, 0], ci.iloc[:, 1],
                                     alpha=0.1, color=sc)
             else:
                 ax.plot(future_Years, forecast, linestyle="dashed",
                         label=f"Forecast ({scenario})", color=color, linewidth=2)
-                ax.fill_between(future_Years, conf_int.iloc[:,0], conf_int.iloc[:,1],
+                ax.fill_between(future_Years, conf_int.iloc[:, 0], conf_int.iloc[:, 1],
                                 alpha=0.18, color=color, label="Uncertainty interval")
 
             ax.axvline(x=last_Year, color="#9ca3af", linestyle=":", linewidth=1)
@@ -463,8 +839,8 @@ def dashboard():
             forecast_df = pd.DataFrame({
                 "Year":        future_Years,
                 "Forecast":    forecast.values.round(4),
-                "Lower Bound": conf_int.iloc[:,0].values.round(4),
-                "Upper Bound": conf_int.iloc[:,1].values.round(4),
+                "Lower Bound": conf_int.iloc[:, 0].values.round(4),
+                "Upper Bound": conf_int.iloc[:, 1].values.round(4),
             })
 
             st.markdown('<hr class="divider">', unsafe_allow_html=True)
@@ -520,7 +896,7 @@ def dashboard():
 
             if show_all:
                 for s_name, s_cfg in scenarios.items():
-                    sc  = scenario_colors[s_name]
+                    sc  = scenario_colors.get(s_name, "gray")
                     pm  = Prophet(
                         yearly_seasonality=False,
                         weekly_seasonality=False,
@@ -531,19 +907,19 @@ def dashboard():
                     pf   = pm.make_future_dataframe(periods=forecast_steps, freq="YE")
                     pfc  = pm.predict(pf)
                     mask = pfc["ds"].dt.year > last_Year
-                    ax.plot(pfc.loc[mask,"ds"].dt.year, pfc.loc[mask,"yhat"],
+                    ax.plot(pfc.loc[mask, "ds"].dt.year, pfc.loc[mask, "yhat"],
                             linestyle="dashed", label=s_name, color=sc, linewidth=2)
-                    ax.fill_between(pfc.loc[mask,"ds"].dt.year,
-                                    pfc.loc[mask,"yhat_lower"], pfc.loc[mask,"yhat_upper"],
+                    ax.fill_between(pfc.loc[mask, "ds"].dt.year,
+                                    pfc.loc[mask, "yhat_lower"], pfc.loc[mask, "yhat_upper"],
                                     alpha=0.1, color=sc)
             else:
-                ax.plot(forecast_raw.loc[future_mask,"ds"].dt.year,
-                        forecast_raw.loc[future_mask,"yhat"],
+                ax.plot(forecast_raw.loc[future_mask, "ds"].dt.year,
+                        forecast_raw.loc[future_mask, "yhat"],
                         linestyle="dashed", color=color, linewidth=2,
                         label=f"Forecast ({scenario})")
-                ax.fill_between(forecast_raw.loc[future_mask,"ds"].dt.year,
-                                forecast_raw.loc[future_mask,"yhat_lower"],
-                                forecast_raw.loc[future_mask,"yhat_upper"],
+                ax.fill_between(forecast_raw.loc[future_mask, "ds"].dt.year,
+                                forecast_raw.loc[future_mask, "yhat_lower"],
+                                forecast_raw.loc[future_mask, "yhat_upper"],
                                 alpha=0.18, color=color, label="Uncertainty interval")
 
             ax.axvline(x=last_Year, color="#9ca3af", linestyle=":", linewidth=1)
@@ -554,11 +930,13 @@ def dashboard():
             ax.legend(fontsize=9)
             st.pyplot(fig)
 
-            forecast_df = forecast_raw.loc[future_mask, ["ds","yhat","yhat_lower","yhat_upper"]].copy()
+            forecast_df = forecast_raw.loc[
+                future_mask, ["ds", "yhat", "yhat_lower", "yhat_upper"]
+            ].copy()
             forecast_df["Year"] = forecast_df["ds"].dt.year
             forecast_df = forecast_df.rename(columns={
                 "yhat": "Forecast", "yhat_lower": "Lower Bound", "yhat_upper": "Upper Bound"
-            })[["Year","Forecast","Lower Bound","Upper Bound"]]
+            })[["Year", "Forecast", "Lower Bound", "Upper Bound"]]
 
             st.markdown('<hr class="divider">', unsafe_allow_html=True)
             st.markdown('<div class="section-title">Prophet Cross Validation</div>',
@@ -567,7 +945,8 @@ def dashboard():
                 df_cv = cross_validation(model, initial="2555 Days",
                                          period="365 Days", horizon="1095 Days")
                 df_p  = performance_metrics(df_cv)
-            st.dataframe(df_p[["horizon","mae","rmse","mape"]].round(4), use_container_width=True)
+            st.dataframe(df_p[["horizon", "mae", "rmse", "mape"]].round(4),
+                         use_container_width=True)
 
         st.markdown('<hr class="divider">', unsafe_allow_html=True)
         st.markdown(f'<div class="section-title">Forecast Table — {label}</div>',
@@ -585,9 +964,10 @@ def dashboard():
 
         @st.cache_data
         def compute_shap(_df):
-            features = ["gdp_n","hdi_n","internet_n","patents_n","startups_n","employment_n","automation_n"]
-            X = _df[features]
-            y = _df["AI_employability"]
+            features = ["gdp_n", "hdi_n", "internet_n", "patents_n",
+                        "startups_n", "employment_n", "automation_n"]
+            X   = _df[features]
+            y   = _df["AI_employability"]
             gbr = GradientBoostingRegressor(random_state=42).fit(X, y)
             explainer = shap.TreeExplainer(gbr)
             return explainer(X)
@@ -611,8 +991,6 @@ def dashboard():
             shap.plots.beeswarm(shap_vals, show=False)
             st.pyplot(fig2)
 
-
-
     # ══════════════════════════════════════
     # PAGE: AI ANALYST (OLLAMA CHAT)
     # ══════════════════════════════════════
@@ -625,10 +1003,12 @@ def dashboard():
         )
 
         if not ollama_model:
-            st.warning("**Ollama not available.** Install from https://ollama.com/download and run `ollama pull llama3`. Chat disabled.")
+            st.warning(
+                "**Ollama not available.** Install from https://ollama.com/download "
+                "and run `ollama pull llama3.2:3b`. Chat disabled."
+            )
 
-
-        # ── Render chat history ──
+        # Render chat history
         for msg in st.session_state.chat_history:
             if msg["role"] == "user":
                 st.markdown(
@@ -639,7 +1019,7 @@ def dashboard():
                 with st.chat_message("assistant"):
                     st.markdown(msg["content"])
 
-        # ── Suggested prompts (shown only when chat is empty) ──
+        # Suggested prompts (only when chat empty)
         if not st.session_state.chat_history:
             st.markdown("**Suggested questions:**")
             suggestions = [
@@ -654,22 +1034,22 @@ def dashboard():
                     st.session_state.chat_history.append({"role": "user", "content": suggestion})
                     st.rerun()
 
-        # ── Chat input ──
         user_input = st.chat_input("Ask anything about the G20 AI Employability data…")
 
         if user_input:
             st.session_state.chat_history.append({"role": "user", "content": user_input})
+            system_prompt        = build_system_prompt(df, global_df)
+            messages_for_ollama  = [{"role": "system", "content": system_prompt}] + \
+                                    st.session_state.chat_history
 
-            # Build message list: system prompt + full history
-            system_prompt = build_system_prompt(df, global_df)
-            messages_for_ollama = [{"role": "system", "content": system_prompt}] + \
-                                   st.session_state.chat_history
-
-            # Stream the response
             with st.chat_message("assistant"):
-                response_text = st.write_stream(
-                    stream_ollama(ollama_model, messages_for_ollama)
-                )
+                response_text = ""
+                for chunk in stream_ollama(ollama_model, messages_for_ollama):
+                    if isinstance(chunk, str) and chunk.strip():
+                        response_text += chunk
+                        st.write(chunk)
+                if not response_text:
+                    st.write("No response generated.")
 
             st.session_state.chat_history.append(
                 {"role": "assistant", "content": response_text}
@@ -681,20 +1061,19 @@ def dashboard():
     # ══════════════════════════════════════
     elif page == "📄 Raw Data":
         st.markdown('<div class="section-title">Raw Dataset</div>', unsafe_allow_html=True)
-        st.markdown('<div class="section-subtitle">Processed G20 data with computed AI Employability Index</div>',
-                    unsafe_allow_html=True)
+        st.markdown(
+            '<div class="section-subtitle">Processed G20 data with computed AI Employability Index</div>',
+            unsafe_allow_html=True
+        )
 
         countries = ["All"] + sorted(df["country"].unique().tolist())
         sel       = st.selectbox("Filter by country", countries)
         view_df   = df if sel == "All" else df[df["country"] == sel]
 
         st.dataframe(
-            view_df.sort_values(["country","Year"])
+            view_df.sort_values(["country", "Year"])
                    .reset_index(drop=True)
-                   .style.format({
-                       "AI_employability": "{:.4f}",
-                       "gdp_per_capita":   "{:,.0f}"
-                   }),
+                   .round({"AI_employability": 4, "gdp_per_capita": 0}),
             use_container_width=True
         )
         st.download_button(
@@ -704,10 +1083,11 @@ def dashboard():
             mime="text/csv"
         )
 
+
 # ---------------------------
 # ROUTER
 # ---------------------------
 if not st.session_state.authenticated:
     login_page()
 else:
-    dashboard() 
+    dashboard()
